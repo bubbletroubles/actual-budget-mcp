@@ -22,21 +22,32 @@ export interface CreateRuleInput {
 const PAYEE_ID_OPS = new Set(['is', 'isNot']);
 
 /**
- * A payee value as Actual stores it in a rule: the payee's id.
+ * A payee value as Actual stores it in a rule: the payee's id, and the name it
+ * belongs to.
  *
  * Actual stores `payee` in a rule as an id. The name used to be saved as
  * typed, so "IF payee is Amazon" was reported as created and never matched,
  * because transactions hold the id. Tested against the engine: an imported
  * Amazon transaction stayed uncategorised under exactly that rule.
  *
- * Conditions and actions match names the way the other tools do: an id, an
- * exact name, or part of a name when only one payee fits. A payee that does
- * not exist is refused on both sides. A condition on it could never match, and
- * an action used to create it, so a typo like "Amazn" quietly became a new
- * payee that the rule then moved transactions to.
+ * An id, or a name in full. Not part of a name, which the tools that resolve
+ * an account or a category do accept: those answer one call, and this is
+ * stored and keeps running until somebody deletes it. "Uber" saved as "Uber
+ * Eats", because that was the only payee containing it, recategorises
+ * transactions for months under a rule whose reply said "Uber".
+ *
+ * A payee that does not exist is refused on both sides. A condition on it
+ * could never match, and an action used to create it, so a typo like "Amazn"
+ * quietly became a new payee that the rule then moved transactions to.
+ *
+ * The name comes back as well so the reply can say which payee this turned
+ * out to be, which is the other half of the same problem: the caller typed
+ * something, and what the rule holds is an id they cannot read.
  */
-async function resolveRulePayee(value: string): Promise<string> {
-  return resolvePayeeIn(await api.getPayees(), value);
+async function resolveRulePayee(value: string): Promise<{ id: string; name: string }> {
+  const payees = await api.getPayees();
+  const id = resolvePayeeIn(payees, value);
+  return { id, name: payees.find((p) => p.id === id)?.name ?? value };
 }
 
 /**
@@ -52,17 +63,21 @@ export async function createRuleFromInput(input: CreateRuleInput): Promise<strin
 
   // Resolve category and payee names to IDs if needed
   let resolvedCondValue: any = condition_value;
+  let conditionPayee: { id: string; name: string } | undefined;
   if (condition_field === 'category') {
     resolvedCondValue = await resolveCategoryId(condition_value);
   } else if (condition_field === 'payee' && PAYEE_ID_OPS.has(condition_op)) {
-    resolvedCondValue = await resolveRulePayee(condition_value);
+    conditionPayee = await resolveRulePayee(condition_value);
+    resolvedCondValue = conditionPayee.id;
   }
 
   let resolvedActionValue: any = action_value;
+  let actionPayee: { id: string; name: string } | undefined;
   if (action_field === 'category') {
     resolvedActionValue = await resolveCategoryId(action_value);
   } else if (action_field === 'payee') {
-    resolvedActionValue = await resolveRulePayee(action_value);
+    actionPayee = await resolveRulePayee(action_value);
+    resolvedActionValue = actionPayee.id;
   }
 
   const rule = {
@@ -87,10 +102,23 @@ export async function createRuleFromInput(input: CreateRuleInput): Promise<strin
   const result = await api.createRule(rule as any);
   await syncNow();
 
+  // Which payee this turned out to be, said rather than left to be trusted.
+  // The caller typed a name and the rule holds an id, so a name that matched
+  // one they did not have in mind is invisible otherwise, and a rule runs
+  // until somebody deletes it.
+  const matched: string[] = [];
+  if (conditionPayee) {
+    matched.push(`  Condition payee: ${conditionPayee.name} (${conditionPayee.id})`);
+  }
+  if (actionPayee) {
+    matched.push(`  Action payee: ${actionPayee.name} (${actionPayee.id})`);
+  }
+
   return [
     'Rule created:',
     `  IF ${condition_field} ${condition_op} "${condition_value}"`,
     `  THEN set ${action_field} = "${action_value}"`,
+    ...matched,
     `  ID: ${(result as any).id}`,
   ];
 }

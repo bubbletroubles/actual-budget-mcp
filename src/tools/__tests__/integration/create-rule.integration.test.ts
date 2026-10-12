@@ -93,7 +93,7 @@ describe.skipIf(skip)('create_rule with a payee', () => {
     expect(rule?.conditions[0].value).toBe(primeId);
   });
 
-  it('prefers an exact name, so "amazon" picks "Amazon" over "Amazon Prime"', async () => {
+  it('matches a name in any case, so "amazon" is "Amazon"', async () => {
     const lines = await createRuleFromInput({
       condition_field: 'payee',
       condition_op: 'is',
@@ -105,19 +105,25 @@ describe.skipIf(skip)('create_rule with a payee', () => {
     expect(rule?.conditions[0].value).toBe(payeeId);
   });
 
-  it('accepts part of a name when only one payee matches it', async () => {
-    const lines = await createRuleFromInput({
-      condition_field: 'payee',
-      condition_op: 'is',
-      condition_value: 'Prime',
-      action_field: 'category',
-      action_value: 'Groceries',
-    });
-    const rule = await storedRule(idFrom(lines));
-    expect(rule?.conditions[0].value).toBe(primeId);
+  it('refuses part of a name even when only one payee contains it', async () => {
+    // A rule is stored and keeps running, so "Prime" quietly saved as "Amazon
+    // Prime" recategorises transactions for months under a reply that said
+    // "Prime". The suggestion is there because the payee probably is the one
+    // they meant; what they have to do is name it.
+    const before = (await api.getRules()).length;
+    await expect(
+      createRuleFromInput({
+        condition_field: 'payee',
+        condition_op: 'is',
+        condition_value: 'Prime',
+        action_field: 'category',
+        action_value: 'Groceries',
+      }),
+    ).rejects.toThrow(/No payee found matching "Prime"[\s\S]*Did you mean: Amazon Prime\?/);
+    expect((await api.getRules()).length).toBe(before);
   });
 
-  it('refuses part of a name that matches more than one payee, and stores nothing', async () => {
+  it('lists every near miss, so the one that was meant is in the reply', async () => {
     const before = (await api.getRules()).length;
     await expect(
       createRuleFromInput({
@@ -127,7 +133,7 @@ describe.skipIf(skip)('create_rule with a payee', () => {
         action_field: 'category',
         action_value: 'Groceries',
       }),
-    ).rejects.toThrow(/Ambiguous payee name "Amaz"/);
+    ).rejects.toThrow(/Did you mean: Amazon, Amazon Prime\?/);
     expect((await api.getRules()).length).toBe(before);
   });
 
@@ -182,6 +188,64 @@ describe.skipIf(skip)('create_rule with a payee', () => {
     });
     const rule = await storedRule(idFrom(lines));
     expect(rule?.actions[0].value).toBe(payeeId);
+  });
+
+  it('says which payee the rule holds, since the name was typed and the id is stored', async () => {
+    // A name that matched one they did not have in mind is invisible
+    // otherwise: the rule holds an id, and the reply quoted what they typed.
+    const lines = await createRuleFromInput({
+      condition_field: 'payee',
+      condition_op: 'is',
+      condition_value: 'amazon',
+      action_field: 'payee',
+      action_value: 'Amazon Prime',
+    });
+    const text = lines.join('\n');
+
+    expect(text).toContain(`Condition payee: Amazon (${payeeId})`);
+    expect(text).toContain(`Action payee: Amazon Prime (${primeId})`);
+  });
+
+  it('says nothing about a payee when the rule has none', async () => {
+    const lines = await createRuleFromInput({
+      condition_field: 'notes',
+      condition_op: 'contains',
+      condition_value: 'AMZN',
+      action_field: 'category',
+      action_value: 'Groceries',
+    });
+
+    expect(lines.join('\n')).not.toMatch(/payee/i);
+  });
+
+  it('refuses two payees with the same name rather than picking one', async () => {
+    // Measured: the engine accepts a second payee with the same name, and
+    // both come back from getPayees. Choosing either would be choosing at
+    // random, and the rule would keep running on it.
+    const twinId = await api.createPayee({ name: 'Netflix' } as never);
+    await api.createPayee({ name: 'Netflix' } as never);
+    const before = (await api.getRules()).length;
+
+    await expect(
+      createRuleFromInput({
+        condition_field: 'payee',
+        condition_op: 'is',
+        condition_value: 'Netflix',
+        action_field: 'category',
+        action_value: 'Groceries',
+      }),
+    ).rejects.toThrow(/Ambiguous payee name "Netflix"/);
+    expect((await api.getRules()).length).toBe(before);
+
+    // And the id still works, which is the way out the message points at.
+    const lines = await createRuleFromInput({
+      condition_field: 'payee',
+      condition_op: 'is',
+      condition_value: twinId,
+      action_field: 'category',
+      action_value: 'Groceries',
+    });
+    expect((await storedRule(idFrom(lines)))?.conditions[0].value).toBe(twinId);
   });
 
   it('refuses an action on a payee that does not exist, and saves no rule and no payee', async () => {
